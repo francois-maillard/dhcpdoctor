@@ -15,9 +15,12 @@ from scapy.all import (
     AnsweringMachine,
     DHCP6_Advertise,
     DHCP6_RelayForward,
+    DHCP6_Request,
     DHCP6_Reply,
     DHCP6_Solicit,
     DHCP6OptClientId,
+    DHCP6OptClientFQDN,
+    DHCP6OptServerId,
     DHCP6OptElapsedTime,
     DHCP6OptIA_NA,
     DHCP6OptIAAddress,
@@ -90,11 +93,23 @@ class DHCPClient:
         self.xid = randint(0, (2 ** 24) - 1)  # BOOTP 4 bytes, DHCPv6 3 bytes
         self.request = None
         self.reply = None
+        self.dhcp_discover = None
+        self.dhcp_offer = None
+        self.dhcp_request = None
+        self.dhcp_ack = None
         self.sniffer = None
         self.offered_address = None
+        self.hostname = None
+        self.server_id = None
 
-    def craft_request(self, *args, **kwargs):
-        self.request = self.craft_discover(*args, **kwargs)
+    def craft_request(self, dhcp_type='discover', *args, **kwargs):
+        if dhcp_type == 'discover':
+            self.dhcp_discover = self.craft_discover(*args, **kwargs)
+            self.request = self.dhcp_discover
+        elif dhcp_type == 'request':
+            self.dhcp_request = self.craft_dhcp_request(*args, **kwargs)
+            self.request = self.dhcp_request
+
         if settings.RELAY_MODE:
             self.add_relay(
                 self.request, settings.SERVER_ADDRESS, settings.RELAY_ADDRESS
@@ -104,6 +119,9 @@ class DHCPClient:
         return self.request
 
     def craft_discover(self, hw=None):
+        raise NotImplementedError
+
+    def craft_dhcp_request(self, hw=None):
         raise NotImplementedError
 
     def add_relay(self, p, srv_ip, relay_ip=None):
@@ -139,18 +157,38 @@ class DHCPClient:
         Returns:
             bool: True if packet matches
         """
-        if self.is_offer_type(reply):
+        is_offer = self.is_offer_type(reply)
+        is_ack = self.is_ack_type(reply)
+
+        if is_offer or is_ack:
             self.reply = reply
             if settings.DEBUG:
                 print(reply.show())
+
+            if is_offer:
+                self.dhcp_offer = self.reply
+            elif is_ack:
+                self.dhcp_ack = self.reply
+
             self.offered_address = self.get_offered_address()
+            self.hostname = self.get_hostname()
+            self.server_id = self.get_server_id()
             return True
         return False
 
     def is_offer_type(self, packet):
         raise NotImplementedError
 
+    def is_ack_type(self, packet):
+        raise NotImplementedError
+
     def get_offered_address(self):
+        raise NotImplementedError
+
+    def get_hostname(self):
+        raise NotImplementedError
+
+    def get_server_id(self):
         raise NotImplementedError
 
     def _get_ether_dst(self):
@@ -186,6 +224,45 @@ class DHCPv4Client(DHCPClient):
             print(dhcp_discover.show())
         return dhcp_discover
 
+    def craft_dhcp_request(self, hw=None):
+        """Generates a DHCPREQUEST packet
+        
+        Args:
+            hw (str|bytes, optional): Defaults to MAC of Scapy's `conf.iface`.
+                Client MAC address to place in `chaddr`.
+        
+        Returns:
+            scapy.layers.inet.IP: DHCPREQUEST packet
+
+        https://www.freesoft.org/CIE/RFC/2131/24.htm
+        """
+
+        if not hw:
+            _, hw = get_if_raw_hwaddr(conf.iface)
+        else:
+            hw = mac_str_to_bytes(hw)
+
+        # server identifier => DHCP server that sent the DHCPOFFER
+        # Client inserts the address of the selected server in 'server
+        # identifier', 'ciaddr' MUST be zero, 'requested IP address' MUST be
+        # filled in with the yiaddr value from the chosen DHCPOFFER. 
+        options = [
+            ("message-type", "request"),
+            ("server_id", self.server_id),
+            ("requested_addr", self.offered_address),
+            "end"
+        ]
+        dhcp_request = (
+            IP(src="0.0.0.0", dst="255.255.255.255")
+            / UDP(sport=68, dport=67)
+            / BOOTP(chaddr=hw, xid=self.xid, flags=0x8000)
+            / DHCP(options=options)
+        )
+        # TODO: param req list
+        if settings.DEBUG:
+            print(dhcp_request.show())
+        return dhcp_request
+
     def add_relay(self, p, srv_ip, relay_ip=None):
         """Modify passed DHCP client packet as if a DHCP relay would
         
@@ -208,16 +285,37 @@ class DHCPv4Client(DHCPClient):
             print(p.show())
 
     def is_offer_type(self, packet):
-        """Checks that packet is a valid DHCP reply
-        
-        The following are checked:
-        * packet contains BOOTP and DHCP layers
-        * BOOTP xid matches request
-        * DHCP message-type must be a DHCPOFFER (2) (others can be added later)
-        
+        """Checks that packet is a valid DHCPOFFER(2)
         Args:
             reply (scapy.packet.Packet): Packet to check
         
+        Returns:
+            bool: True if packet matches
+        """
+        return self.is_specific_type(packet, 2)
+
+    def is_ack_type(self, packet):
+        """Checks that packet is a valid DHCPACK(5)
+        Args:
+            reply (scapy.packet.Packet): Packet to check
+        
+        Returns:
+            bool: True if packet matches
+        """
+        return self.is_specific_type(packet, 5)
+
+    def is_specific_type(self, packet, dhcp_type):
+        """Checks that packet is a valid DHCP message of type dhcp_type
+
+        The following are checked:
+        * packet contains BOOTP and DHCP layers
+        * BOOTP xid matches request
+        * DHCP message-type must match dhcp_type
+
+        Args:
+            reply (scapy.packet.Packet): Packet to check
+            dhcp_type: the DHCP message-type
+
         Returns:
             bool: True if packet matches
         """
@@ -230,12 +328,37 @@ class DHCPv4Client(DHCPClient):
         if not packet.haslayer(DHCP):
             return False
         req_type = [x[1] for x in packet[DHCP].options if x[0] == 'message-type'][0]
-        if req_type in [2]:
+        if req_type in [dhcp_type]:
             return True
         return False
 
     def get_offered_address(self):
         return self.reply[BOOTP].yiaddr
+
+    def _get_option(self, key):
+        must_decode = ['hostname', 'domain', 'vendor_class_id']
+        try:
+            for i in self.reply[DHCP].options:
+                if i[0] == key:
+                    # If DHCP Server Returned multiple name servers
+                    # return all as comma seperated string.
+                    if key == 'name_server' and len(i) > 2:
+                        return ",".join(i[1:])
+                    # domain and hostname are binary strings,
+                    # decode to unicode string before returning
+                    elif key in must_decode:
+                        return i[1].decode()
+                    else:
+                        return i[1]
+        except Exception as e:
+            print(e)
+            return None
+
+    def get_hostname(self):
+        return self._get_option('hostname')
+
+    def get_server_id(self):
+        return self._get_option('server_id')
 
     def _get_ether_dst(self):
         return self.MAC_BROADCAST
@@ -270,6 +393,50 @@ class DHCPv6Client(DHCPClient):
         if settings.DEBUG:
             print(dhcp_solicit.show())
         return dhcp_solicit
+
+    def craft_dhcp_request(self, hw=None):
+        """Generates a DHCPv6 Request packet
+        
+        Args:
+            hw (str|bytes, optional): Defaults to MAC of Scapy's `conf.iface`.
+                Client MAC address to use for DUID LL.
+        
+        Returns:
+            scapy.layers.inet.IPv6: DHCPv6 Request packet
+        """
+        if not hw:
+            _, hw = get_if_raw_hwaddr(conf.iface)
+        else:
+            hw = mac_str_to_bytes(hw)
+
+        # TODO
+        # Request Message
+        # - sent by clients
+        # - includes a server identifier option
+        # - the content of Server Identifier option must match server's DUID
+        # - includes a client identifier option
+        # - must include an ORO Option (even with hints) p40
+        # - can includes a reconfigure Accept option indicating whether or
+        #   not the client is willing to accept Reconfigure messages from
+        #   the server (p40)
+        # - When the server receives a Request message via unicast from a
+        # client to which the server has not sent a unicast option, the server
+        # discards the Request message and responds with a Reply message
+        # containing Status Code option with the value UseMulticast, a Server
+        # Identifier Option containing the server's DUID, the client
+        # Identifier option from the client message and no other option.
+        dhcp_request = (
+            IPv6(dst="ff02::1:2")
+            / UDP(sport=546, dport=547)
+            / DHCP6_Request(trid=self.xid)
+            / DHCP6OptServerId(duid=self.server_id)
+            / DHCP6OptElapsedTime()
+            / DHCP6OptClientId(duid=DUID_LL(lladdr=hw))
+            / DHCP6OptIA_NA(iaid=0)
+        )
+        if settings.DEBUG:
+            print(dhcp_request.show())
+        return dhcp_request
 
     def add_relay(self, p, srv_ip, relay_ip=None):
         """Modify passed DHCP client packet as if a DHCP relay would
@@ -317,7 +484,7 @@ class DHCPv6Client(DHCPClient):
             bool: True if packet matches
         """
 
-        if not (packet.haslayer(DHCP6_Advertise) or packet.haslayer(DHCP6_Reply)):
+        if not packet.haslayer(DHCP6_Advertise):
             return False
         if packet[DHCP6_Advertise].trid != self.xid:
             return False
@@ -325,8 +492,23 @@ class DHCPv6Client(DHCPClient):
             return False
         return True
 
+    def is_ack_type(self, packet):
+        if not packet.haslayer(DHCP6_Reply):
+            return False
+        if packet[DHCP6_Reply].trid != self.xid:
+            return False
+        if not packet.haslayer(DHCP6OptIA_NA):
+            return False
+        return True
+
     def get_offered_address(self):
         return self.reply[DHCP6OptIAAddress].addr
+
+    def get_hostname(self):
+        return self.reply[DHCP6OptClientFQDN].fqdn
+
+    def get_server_id(self):
+        return self.reply[DHCP6OptServerId].duid
 
     def _get_ether_dst(self):
         return self.MAC_MCAST
